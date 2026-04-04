@@ -1,0 +1,10 @@
+spec_version: 1
+name: ticket_triage_env
+version: "0.1.0"
+description: "Real-world customer support ticket triage environment."
+type: space
+runtime: fastapi
+app: server.app:app
+port: 8000
+action: TicketTriageAction
+observation: TicketTriageObservation
