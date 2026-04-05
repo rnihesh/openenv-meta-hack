@@ -1,14 +1,15 @@
 """Baseline inference script for ticket_triage_env.
 
 Required environment variables:
-- API_BASE_URL
-- MODEL_NAME
-- HF_TOKEN
+  API_BASE_URL   The LLM API endpoint.
+  MODEL_NAME     The model identifier.
+  HF_TOKEN       Your Hugging Face / API key.
 
 Optional:
-- IMAGE_NAME (default: ticket-triage-env:latest)
-- MAX_STEPS
-- SUCCESS_SCORE_THRESHOLD
+  ENV_BASE_URL           URL of the running environment server (default: http://localhost:8000)
+  IMAGE_NAME             Docker image name (default: ticket-triage-env:latest)
+  MAX_STEPS              Max steps per task episode (default: 8)
+  SUCCESS_SCORE_THRESHOLD  Score threshold for success (default: 0.75)
 """
 
 import asyncio
@@ -17,16 +18,14 @@ import os
 import re
 from typing import Any, Dict, List, Optional
 
+import httpx
 from openai import OpenAI
-
-from client import TicketTriageEnv
-from models import TicketSnapshot, TicketTriageAction, TicketTriageObservation
-from tasks import list_task_ids
 
 BENCHMARK = "ticket_triage_env"
 API_BASE_URL = os.getenv("API_BASE_URL", "").strip()
 MODEL_NAME = os.getenv("MODEL_NAME", "").strip()
 API_KEY = (os.getenv("HF_TOKEN") or os.getenv("OPENAI_API_KEY") or "").strip()
+ENV_BASE_URL = os.getenv("ENV_BASE_URL", "http://localhost:8000").rstrip("/")
 IMAGE_NAME = os.getenv("IMAGE_NAME", "ticket-triage-env:latest").strip()
 MAX_STEPS = int(os.getenv("MAX_STEPS", "8"))
 SUCCESS_SCORE_THRESHOLD = float(os.getenv("SUCCESS_SCORE_THRESHOLD", "0.75"))
@@ -40,15 +39,15 @@ VALID_TEAMS = [
     "trust_safety",
     "fulfillment",
 ]
+TASK_IDS = ["easy", "medium", "hard"]
 
 
-def clamp(value: float, low: float = 0.0, high: float = 1.0) -> float:
-    return max(low, min(value, high))
-
+# ---------------------------------------------------------------------------
+# Structured logging (required format)
+# ---------------------------------------------------------------------------
 
 def log_start(task: str, env: str, model: str) -> None:
-    payload = {"task": task, "env": env, "model": model}
-    print(f"[START] {json.dumps(payload, ensure_ascii=True)}", flush=True)
+    print(f"[START] {json.dumps({'task': task, 'env': env, 'model': model}, ensure_ascii=True)}", flush=True)
 
 
 def log_step(step: int, action: Dict[str, Any], reward: float, done: bool, error: Optional[str]) -> None:
@@ -67,26 +66,65 @@ def log_end(success: bool, steps: int, score: float, rewards: List[float]) -> No
         "success": bool(success),
         "steps": int(steps),
         "score": round(float(score), 6),
-        "rewards": [round(float(item), 6) for item in rewards],
+        "rewards": [round(float(r), 6) for r in rewards],
     }
     print(f"[END] {json.dumps(payload, ensure_ascii=True)}", flush=True)
+
+
+# ---------------------------------------------------------------------------
+# Environment HTTP client
+# ---------------------------------------------------------------------------
+
+class EnvHTTPClient:
+    """Thin async HTTP wrapper around the OpenEnv server."""
+
+    def __init__(self, base_url: str):
+        self._base = base_url.rstrip("/")
+        self._client = httpx.AsyncClient(timeout=30.0)
+        self._session_id: Optional[str] = None
+
+    async def reset(self, task_id: str) -> Dict[str, Any]:
+        resp = await self._client.post(
+            f"{self._base}/reset",
+            json={"task_id": task_id},
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        self._session_id = data.get("session_id") or data.get("episode_id")
+        return data
+
+    async def step(self, action: Dict[str, Any]) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {"action": action}
+        if self._session_id:
+            payload["request_id"] = self._session_id
+        resp = await self._client.post(f"{self._base}/step", json=payload)
+        resp.raise_for_status()
+        return resp.json()
+
+    async def close(self) -> None:
+        await self._client.aclose()
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def clamp(value: float, low: float = 0.0, high: float = 1.0) -> float:
+    return max(low, min(value, high))
 
 
 def _extract_json(text: str) -> Optional[Dict[str, Any]]:
     text = text.strip()
     if not text:
         return None
-
     try:
         parsed = json.loads(text)
         return parsed if isinstance(parsed, dict) else None
     except json.JSONDecodeError:
         pass
-
     match = re.search(r"\{.*\}", text, flags=re.DOTALL)
     if not match:
         return None
-
     try:
         parsed = json.loads(match.group(0))
         return parsed if isinstance(parsed, dict) else None
@@ -95,52 +133,50 @@ def _extract_json(text: str) -> Optional[Dict[str, Any]]:
 
 
 def _normalize(value: Any, allowed: List[str], default: str) -> str:
-    if isinstance(value, str):
-        lowered = value.strip().lower()
-        if lowered in allowed:
-            return lowered
+    if isinstance(value, str) and value.strip().lower() in allowed:
+        return value.strip().lower()
     return default
 
 
-def _find_ticket(observation: TicketTriageObservation, ticket_id: str) -> Optional[TicketSnapshot]:
-    for ticket in observation.tickets:
-        if ticket.ticket_id == ticket_id:
-            return ticket
-    return None
+# ---------------------------------------------------------------------------
+# Heuristic fallback policy
+# ---------------------------------------------------------------------------
 
+def heuristic_action(obs: Dict[str, Any]) -> Dict[str, Any]:
+    pending = obs.get("pending_ticket_ids", [])
+    tickets = {t["ticket_id"]: t for t in obs.get("tickets", [])}
 
-def heuristic_action(observation: TicketTriageObservation) -> TicketTriageAction:
-    if not observation.pending_ticket_ids:
-        fallback_ticket = observation.triaged_ticket_ids[-1] if observation.triaged_ticket_ids else ""
-        return TicketTriageAction(
-            ticket_id=fallback_ticket,
-            predicted_category="technical",
-            predicted_priority="low",
-            assigned_team="tech_support",
-            resolution_summary="No pending ticket. Ask for reset.",
-            finalize=True,
-        )
+    if not pending:
+        triaged = obs.get("triaged_ticket_ids", [])
+        return {
+            "ticket_id": triaged[-1] if triaged else "",
+            "predicted_category": "technical",
+            "predicted_priority": "low",
+            "assigned_team": "tech_support",
+            "resolution_summary": "No pending tickets. Finalizing.",
+            "finalize": True,
+        }
 
-    ticket_id = observation.pending_ticket_ids[0]
-    ticket = _find_ticket(observation, ticket_id)
-    message = ticket.customer_message.lower() if ticket else ""
+    ticket_id = pending[0]
+    ticket = tickets.get(ticket_id, {})
+    message = ticket.get("customer_message", "").lower()
 
-    if any(token in message for token in ["refund", "charged", "invoice", "payment"]):
+    if any(t in message for t in ["refund", "charged", "invoice", "payment"]):
         category = "billing"
-    elif any(token in message for token in ["harass", "abuse", "threat", "suspicious", "take over"]):
+    elif any(t in message for t in ["harass", "abuse", "threat", "suspicious", "take over"]):
         category = "abuse"
-    elif any(token in message for token in ["address", "shipment", "order", "dispatch"]):
+    elif any(t in message for t in ["address", "shipment", "order", "dispatch"]):
         category = "shipping"
-    elif any(token in message for token in ["password", "login", "2fa", "account", "api key"]):
+    elif any(t in message for t in ["password", "login", "2fa", "account", "api key"]):
         category = "account"
     else:
         category = "technical"
 
-    if any(token in message for token in ["urgent", "immediate", "now", "deadline", "harass", "take over"]):
+    if any(t in message for t in ["urgent", "immediate", "now", "deadline", "harass", "take over"]):
         priority = "urgent"
-    elif any(token in message for token in ["blocked", "crash", "charged twice", "legal"]):
+    elif any(t in message for t in ["blocked", "crash", "charged twice", "legal"]):
         priority = "high"
-    elif any(token in message for token in ["today", "tomorrow", "before"]):
+    elif any(t in message for t in ["today", "tomorrow", "before"]):
         priority = "medium"
     else:
         priority = "low"
@@ -153,47 +189,47 @@ def heuristic_action(observation: TicketTriageObservation) -> TicketTriageAction
         "account": "account_services",
     }
     team = team_map.get(category, "tech_support")
-    if category == "account" and any(token in message for token in ["suspicious", "take over", "api key"]):
+    if category == "account" and any(t in message for t in ["suspicious", "take over", "api key"]):
         team = "trust_safety"
 
-    summary_tokens = ["review", "customer", "follow-up"]
-    if category == "billing":
-        summary_tokens = ["invoice", "refund", "deadline"]
-    elif category == "abuse":
-        summary_tokens = ["escalate", "evidence", "secure"]
-    elif category == "technical":
-        summary_tokens = ["reproduce", "logs", "audit"]
-    elif category == "shipping":
-        summary_tokens = ["address", "shipment", "confirm"]
-    elif category == "account":
-        summary_tokens = ["reset", "verification", "investigate"]
+    summary_map = {
+        "billing": "invoice refund deadline",
+        "abuse": "escalate evidence secure",
+        "technical": "reproduce logs audit",
+        "shipping": "address shipment confirm",
+        "account": "reset verification investigate",
+    }
+    summary = summary_map.get(category, "review customer follow-up")
+    finalize = len(pending) == 1
 
-    finalize = len(observation.pending_ticket_ids) == 1
-    return TicketTriageAction(
-        ticket_id=ticket_id,
-        predicted_category=category,
-        predicted_priority=priority,
-        assigned_team=team,
-        resolution_summary=" ".join(summary_tokens),
-        finalize=finalize,
-    )
+    return {
+        "ticket_id": ticket_id,
+        "predicted_category": category,
+        "predicted_priority": priority,
+        "assigned_team": team,
+        "resolution_summary": summary,
+        "finalize": finalize,
+    }
 
+
+# ---------------------------------------------------------------------------
+# Model action
+# ---------------------------------------------------------------------------
 
 def get_model_action(
     client: Optional[OpenAI],
-    observation: TicketTriageObservation,
+    obs: Dict[str, Any],
     history: List[str],
-) -> TicketTriageAction:
-    fallback = heuristic_action(observation)
-
+) -> Dict[str, Any]:
+    fallback = heuristic_action(obs)
     if client is None:
         return fallback
 
     prompt = {
-        "task_id": observation.task_id,
-        "objective": observation.objective,
-        "pending_ticket_ids": observation.pending_ticket_ids,
-        "tickets": [ticket.model_dump() for ticket in observation.tickets],
+        "task_id": obs.get("task_id"),
+        "objective": obs.get("objective"),
+        "pending_ticket_ids": obs.get("pending_ticket_ids", []),
+        "tickets": obs.get("tickets", []),
         "history": history[-8:],
         "required_output": {
             "ticket_id": "string",
@@ -213,47 +249,41 @@ def get_model_action(
                 {
                     "role": "system",
                     "content": (
-                        "You are a support operations assistant. Return exactly one JSON object "
-                        "with the requested fields and no markdown."
+                        "You are a support operations assistant. "
+                        "Return exactly one JSON object with the requested fields and no markdown."
                     ),
                 },
-                {
-                    "role": "user",
-                    "content": json.dumps(prompt, ensure_ascii=True),
-                },
+                {"role": "user", "content": json.dumps(prompt, ensure_ascii=True)},
             ],
         )
-        message = response.choices[0].message.content or ""
-        payload = _extract_json(message)
+        payload = _extract_json(response.choices[0].message.content or "")
         if payload is None:
             return fallback
 
-        return TicketTriageAction(
-            ticket_id=str(payload.get("ticket_id", fallback.ticket_id)),
-            predicted_category=_normalize(
-                payload.get("predicted_category"),
-                VALID_CATEGORIES,
-                fallback.predicted_category,
+        return {
+            "ticket_id": str(payload.get("ticket_id", fallback["ticket_id"])),
+            "predicted_category": _normalize(
+                payload.get("predicted_category"), VALID_CATEGORIES, fallback["predicted_category"]
             ),
-            predicted_priority=_normalize(
-                payload.get("predicted_priority"),
-                VALID_PRIORITIES,
-                fallback.predicted_priority,
+            "predicted_priority": _normalize(
+                payload.get("predicted_priority"), VALID_PRIORITIES, fallback["predicted_priority"]
             ),
-            assigned_team=_normalize(
-                payload.get("assigned_team"),
-                VALID_TEAMS,
-                fallback.assigned_team,
+            "assigned_team": _normalize(
+                payload.get("assigned_team"), VALID_TEAMS, fallback["assigned_team"]
             ),
-            resolution_summary=str(payload.get("resolution_summary", fallback.resolution_summary))[:500],
-            finalize=bool(payload.get("finalize", fallback.finalize)),
-        )
+            "resolution_summary": str(payload.get("resolution_summary", fallback["resolution_summary"]))[:500],
+            "finalize": bool(payload.get("finalize", fallback["finalize"])),
+        }
     except Exception as exc:
         print(f"[DEBUG] Model request failed: {exc}", flush=True)
         return fallback
 
 
-async def run_task(env: TicketTriageEnv, client: Optional[OpenAI], task_id: str) -> float:
+# ---------------------------------------------------------------------------
+# Task runner
+# ---------------------------------------------------------------------------
+
+async def run_task(env: EnvHTTPClient, client: Optional[OpenAI], task_id: str) -> float:
     rewards: List[float] = []
     history: List[str] = []
     steps_taken = 0
@@ -263,19 +293,20 @@ async def run_task(env: TicketTriageEnv, client: Optional[OpenAI], task_id: str)
     log_start(task=task_id, env=BENCHMARK, model=MODEL_NAME)
 
     result = await env.reset(task_id=task_id)
+    obs = result.get("observation", result)
 
     for step in range(1, MAX_STEPS + 1):
-        if result.done:
+        if result.get("done", False):
             break
 
-        action = get_model_action(client, result.observation, history)
-        action_payload = action.model_dump()
+        action = get_model_action(client, obs, history)
         error: Optional[str] = None
 
         try:
             result = await env.step(action)
-            reward = float(result.reward or 0.0)
-            done = bool(result.done)
+            obs = result.get("observation", result)
+            reward = float(result.get("reward") or 0.0)
+            done = bool(result.get("done", False))
         except Exception as exc:
             reward = -0.2
             done = False
@@ -283,11 +314,13 @@ async def run_task(env: TicketTriageEnv, client: Optional[OpenAI], task_id: str)
 
         rewards.append(reward)
         steps_taken = step
-        log_step(step=step, action=action_payload, reward=reward, done=done, error=error)
+        log_step(step=step, action=action, reward=reward, done=done, error=error)
 
         history.append(
-            f"step={step} ticket={action.ticket_id} category={action.predicted_category} "
-            f"priority={action.predicted_priority} team={action.assigned_team} reward={reward:.3f}"
+            f"step={step} ticket={action['ticket_id']} "
+            f"category={action['predicted_category']} "
+            f"priority={action['predicted_priority']} "
+            f"team={action['assigned_team']} reward={reward:.3f}"
         )
 
         if error is not None:
@@ -295,11 +328,11 @@ async def run_task(env: TicketTriageEnv, client: Optional[OpenAI], task_id: str)
         if done:
             break
 
-    final_obs = result.observation
-    if final_obs.final_score is not None:
-        score = clamp(float(final_obs.final_score), 0.0, 1.0)
+    final_score = obs.get("final_score")
+    if final_score is not None:
+        score = clamp(float(final_score))
     elif rewards:
-        score = clamp(sum(rewards) / max(float(len(rewards)), 1.0), 0.0, 1.0)
+        score = clamp(sum(rewards) / max(float(len(rewards)), 1.0))
     else:
         score = 0.0
 
@@ -308,28 +341,27 @@ async def run_task(env: TicketTriageEnv, client: Optional[OpenAI], task_id: str)
     return score
 
 
-async def main() -> None:
-    required = [name for name in ("API_BASE_URL", "MODEL_NAME", "HF_TOKEN") if not os.getenv(name)]
-    if required:
-        raise RuntimeError(
-            "Missing required environment variables: " + ", ".join(required)
-        )
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
 
-    client: Optional[OpenAI]
-    if API_KEY:
+async def main() -> None:
+    # Allow running with heuristic fallback if API credentials are missing
+    client: Optional[OpenAI] = None
+    if API_BASE_URL and MODEL_NAME and API_KEY:
         client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
     else:
-        client = None
+        print("[DEBUG] Running with heuristic fallback (no API credentials)", flush=True)
 
-    env = await TicketTriageEnv.from_docker_image(IMAGE_NAME)
+    env = EnvHTTPClient(ENV_BASE_URL)
     try:
-        for task_id in list_task_ids():
+        for task_id in TASK_IDS:
             await run_task(env=env, client=client, task_id=task_id)
     finally:
         try:
             await env.close()
         except Exception as exc:
-            print(f"[DEBUG] env.close() error (container cleanup): {exc}", flush=True)
+            print(f"[DEBUG] env.close() error: {exc}", flush=True)
 
 
 if __name__ == "__main__":

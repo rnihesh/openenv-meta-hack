@@ -10,13 +10,21 @@ except Exception as exc:  # pragma: no cover
 try:
     from ..models import TicketTriageAction, TicketTriageObservation
     from .ticket_triage_environment import TicketTriageEnvironment
-except ModuleNotFoundError:  # pragma: no cover
+except (ModuleNotFoundError, ImportError):  # pragma: no cover
     from models import TicketTriageAction, TicketTriageObservation
     from server.ticket_triage_environment import TicketTriageEnvironment
 
+# Singleton environment instance — the HTTP server calls the factory on every
+# step/reset, so we return the same instance to preserve episode state.
+_env_instance = TicketTriageEnvironment()
+
+
+def _env_factory() -> TicketTriageEnvironment:
+    return _env_instance
+
 
 app = create_app(
-    TicketTriageEnvironment,
+    _env_factory,
     TicketTriageAction,
     TicketTriageObservation,
     env_name="ticket_triage_env",
@@ -33,9 +41,4 @@ def main(host: str = "0.0.0.0", port: int = 8000) -> None:
 
 
 if __name__ == "__main__":
-    import argparse
-
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--port", type=int, default=8000)
-    args = parser.parse_args()
-    main(port=args.port)
+    main()

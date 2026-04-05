@@ -11,7 +11,7 @@ try:
     from ..graders import EpisodeGrade, evaluate_ticket, grade_task
     from ..models import TicketSnapshot, TicketTriageAction, TicketTriageObservation, TicketTriageReward
     from ..tasks import TASK_LIBRARY, TaskSpec, list_task_ids
-except ImportError:  # pragma: no cover
+except (ImportError, ModuleNotFoundError):  # pragma: no cover
     from graders import EpisodeGrade, evaluate_ticket, grade_task
     from models import TicketSnapshot, TicketTriageAction, TicketTriageObservation, TicketTriageReward
     from tasks import TASK_LIBRARY, TaskSpec, list_task_ids
