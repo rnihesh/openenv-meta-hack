@@ -1,12 +1,11 @@
 ---
 title: Ticket Triage OpenEnv
-emoji: inbox_tray
+emoji: 📥
 colorFrom: blue
 colorTo: green
 sdk: docker
 pinned: false
 app_port: 8000
-base_path: /web
 tags:
   - openenv
 ---
