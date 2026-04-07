@@ -22,10 +22,12 @@ import httpx
 from openai import OpenAI
 
 BENCHMARK = "ticket_triage_env"
-API_BASE_URL = os.getenv("API_BASE_URL", "").strip()
-MODEL_NAME = os.getenv("MODEL_NAME", "").strip()
-# Accept API_KEY (injected by validator), HF_TOKEN, or OPENAI_API_KEY
-API_KEY = (os.getenv("API_KEY") or os.getenv("HF_TOKEN") or os.getenv("OPENAI_API_KEY") or "").strip()
+API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
+MODEL_NAME = os.getenv("MODEL_NAME", "Qwen/Qwen2.5-72B-Instruct")
+HF_TOKEN = os.getenv("HF_TOKEN")  # no default — injected by validator
+LOCAL_IMAGE_NAME = os.getenv("LOCAL_IMAGE_NAME")  # optional, for from_docker_image()
+# Accept HF_TOKEN (injected by validator) or API_KEY fallback
+API_KEY = HF_TOKEN or os.getenv("API_KEY") or os.getenv("OPENAI_API_KEY") or ""
 ENV_BASE_URL = os.getenv("ENV_BASE_URL", "http://localhost:8000").rstrip("/")
 IMAGE_NAME = os.getenv("IMAGE_NAME", "ticket-triage-env:latest").strip()
 MAX_STEPS = int(os.getenv("MAX_STEPS", "8"))
@@ -48,28 +50,19 @@ TASK_IDS = ["easy", "medium", "hard"]
 # ---------------------------------------------------------------------------
 
 def log_start(task: str, env: str, model: str) -> None:
-    print(f"[START] {json.dumps({'task': task, 'env': env, 'model': model}, ensure_ascii=True)}", flush=True)
+    print(f"[START] task={task} env={env} model={model}", flush=True)
 
 
-def log_step(step: int, action: Dict[str, Any], reward: float, done: bool, error: Optional[str]) -> None:
-    payload = {
-        "step": step,
-        "action": action,
-        "reward": round(float(reward), 6),
-        "done": bool(done),
-        "error": error,
-    }
-    print(f"[STEP] {json.dumps(payload, ensure_ascii=True)}", flush=True)
+def log_step(step: int, action: Any, reward: float, done: bool, error: Optional[str]) -> None:
+    action_str = json.dumps(action, ensure_ascii=True) if isinstance(action, dict) else str(action)
+    done_val = str(done).lower()
+    error_val = error if error else "null"
+    print(f"[STEP] step={step} action={action_str} reward={reward:.2f} done={done_val} error={error_val}", flush=True)
 
 
 def log_end(success: bool, steps: int, score: float, rewards: List[float]) -> None:
-    payload = {
-        "success": bool(success),
-        "steps": int(steps),
-        "score": round(float(score), 6),
-        "rewards": [round(float(r), 6) for r in rewards],
-    }
-    print(f"[END] {json.dumps(payload, ensure_ascii=True)}", flush=True)
+    rewards_str = ",".join(f"{r:.2f}" for r in rewards)
+    print(f"[END] success={str(success).lower()} steps={steps} score={score:.3f} rewards={rewards_str}", flush=True)
 
 
 # ---------------------------------------------------------------------------
@@ -345,12 +338,8 @@ async def run_task(env: EnvHTTPClient, client: OpenAI, task_id: str) -> float:
 # ---------------------------------------------------------------------------
 
 async def main() -> None:
-    # Always attempt to use the LLM — the validator injects API_BASE_URL and API_KEY
-    if not API_BASE_URL or not MODEL_NAME or not API_KEY:
-        raise RuntimeError(
-            f"Missing required env vars. Got: API_BASE_URL={repr(API_BASE_URL)} "
-            f"MODEL_NAME={repr(MODEL_NAME)} API_KEY={'set' if API_KEY else 'missing'}"
-        )
+    if not API_KEY:
+        raise RuntimeError("HF_TOKEN (or API_KEY) environment variable is required")
     client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
 
     env = EnvHTTPClient(ENV_BASE_URL)
