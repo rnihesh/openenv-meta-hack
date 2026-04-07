@@ -24,7 +24,8 @@ from openai import OpenAI
 BENCHMARK = "ticket_triage_env"
 API_BASE_URL = os.getenv("API_BASE_URL", "").strip()
 MODEL_NAME = os.getenv("MODEL_NAME", "").strip()
-API_KEY = (os.getenv("HF_TOKEN") or os.getenv("OPENAI_API_KEY") or "").strip()
+# Accept API_KEY (injected by validator), HF_TOKEN, or OPENAI_API_KEY
+API_KEY = (os.getenv("API_KEY") or os.getenv("HF_TOKEN") or os.getenv("OPENAI_API_KEY") or "").strip()
 ENV_BASE_URL = os.getenv("ENV_BASE_URL", "http://localhost:8000").rstrip("/")
 IMAGE_NAME = os.getenv("IMAGE_NAME", "ticket-triage-env:latest").strip()
 MAX_STEPS = int(os.getenv("MAX_STEPS", "8"))
@@ -217,13 +218,11 @@ def heuristic_action(obs: Dict[str, Any]) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 def get_model_action(
-    client: Optional[OpenAI],
+    client: OpenAI,
     obs: Dict[str, Any],
     history: List[str],
 ) -> Dict[str, Any]:
     fallback = heuristic_action(obs)
-    if client is None:
-        return fallback
 
     prompt = {
         "task_id": obs.get("task_id"),
@@ -283,7 +282,7 @@ def get_model_action(
 # Task runner
 # ---------------------------------------------------------------------------
 
-async def run_task(env: EnvHTTPClient, client: Optional[OpenAI], task_id: str) -> float:
+async def run_task(env: EnvHTTPClient, client: OpenAI, task_id: str) -> float:
     rewards: List[float] = []
     history: List[str] = []
     steps_taken = 0
@@ -346,12 +345,13 @@ async def run_task(env: EnvHTTPClient, client: Optional[OpenAI], task_id: str) -
 # ---------------------------------------------------------------------------
 
 async def main() -> None:
-    # Allow running with heuristic fallback if API credentials are missing
-    client: Optional[OpenAI] = None
-    if API_BASE_URL and MODEL_NAME and API_KEY:
-        client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
-    else:
-        print("[DEBUG] Running with heuristic fallback (no API credentials)", flush=True)
+    # Always attempt to use the LLM — the validator injects API_BASE_URL and API_KEY
+    if not API_BASE_URL or not MODEL_NAME or not API_KEY:
+        raise RuntimeError(
+            f"Missing required env vars. Got: API_BASE_URL={repr(API_BASE_URL)} "
+            f"MODEL_NAME={repr(MODEL_NAME)} API_KEY={'set' if API_KEY else 'missing'}"
+        )
+    client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
 
     env = EnvHTTPClient(ENV_BASE_URL)
     try:
